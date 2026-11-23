@@ -1,0 +1,166 @@
+---
+title: "Social item network and community detection"
+author: "Estherina Trachtenberg"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+Code accompanying: Trachtenberg, E., Mousley, A., Jelen, M., & Astle, D. *Mapping social functioning profiles across childhood neurodevelopmental difficulties: links with diagnosis, cognition, and everyday executive function.*
+
+This file covers the first step of the pipeline (Figure 1). Social behaviour and peer relationship items were drawn from three parent-report questionnaires collected within CALM (Holmes et al., 2019): the SDQ, CCC-2 and Conners-3. Twenty-two items indexing social functioning were selected (Table S1). Item-level relationships were modelled using a regularised partial correlation network (EBICglasso), and communities were identified using Louvain modularity optimisation to derive the social dimensions.
+
+**Data availability.** No data are included in this repository; the code is shared to show the analysis. CALM data are available via the [CALM data portal](https://portal.camide.cam.ac.uk/overview/1158), subject to the cohort's data access procedures.
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(polycor)    # hetcor()
+library(corrplot)
+library(qgraph)     # EBICglasso(), network plot
+library(igraph)     # Louvain and Walktrap community detection
+```
+
+# Load and merge questionnaires
+
+CALM data come in two batches (CALM 200 and CALM 800), which are combined for each questionnaire.
+
+```{r}
+sdq200      <- read.csv("CALM200-Assessments-calm200_sdq.csv", fileEncoding = "ISO-8859-1")
+sdq800      <- read.csv("Assessments-sdq.csv", fileEncoding = "ISO-8859-1")
+ccc200      <- read.csv("CALM200-Assessments-calm200_ccc2.csv", fileEncoding = "ISO-8859-1")
+ccc800      <- read.csv("Assessments-ccc2.csv", fileEncoding = "ISO-8859-1")
+conners200  <- read.csv("CALM200-Assessments-calm200_conners.csv", fileEncoding = "ISO-8859-1")
+conners800  <- read.csv("Assessments-conners.csv", fileEncoding = "ISO-8859-1")
+
+# Column 34 is named differently in the two CCC-2 batches
+colnames(ccc800)[34] <- "ccc2_valid"
+stopifnot(all(colnames(ccc200) == colnames(ccc800)))
+
+sdq_all     <- rbind(sdq200, sdq800)
+ccc_all     <- rbind(ccc200, ccc800)
+conners_all <- rbind(conners200, conners800)
+
+allscales_df <- sdq_all %>%
+  full_join(ccc_all, by = "id") %>%
+  full_join(conners_all, by = "id")
+```
+
+# Social items (Table S1)
+
+```{r}
+item_groups <- list(
+  SDQ     = c("sdq1", "sdq4", "sdq9", "sdq17", "sdq20",
+              "sdq6", "sdq11", "sdq14", "sdq19", "sdq23"),
+  CCC2    = c("ccc2_3", "ccc2_7", "ccc2_13", "ccc2_16", "ccc2_33", "ccc2_57", "ccc2_67"),
+  Conners = c("conners4", "conners6", "conners18", "conners38", "conners43")
+)
+soc_items <- unlist(item_groups, use.names = FALSE)
+
+socitems_df <- allscales_df %>%
+  dplyr::select(id, all_of(soc_items)) %>%
+  mutate(across(-id, as.numeric))
+
+nrow(socitems_df)
+```
+
+# Missing data
+
+Missing values were 2% or less per item and were replaced with the item mean.
+
+```{r}
+round(colMeans(is.na(socitems_df[soc_items])) * 100, 1)
+
+socitems_imp <- socitems_df %>%
+  mutate(across(-id, ~ replace_na(.x, mean(.x, na.rm = TRUE))))
+```
+
+# Harmonising response scales
+
+The questionnaires use different response scales, so each item was z-scored and then rescaled to the 0-1 range.
+
+```{r}
+z_score <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+rescale_0_1 <- function(x) (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+
+socitems_z <- socitems_imp %>%
+  mutate(across(-id, z_score))
+
+socitems_harmonised <- socitems_z %>%
+  mutate(across(-id, ~ round(rescale_0_1(.x), 2)))
+
+item_data <- socitems_harmonised %>% dplyr::select(-id)
+```
+
+# Item correlations
+
+```{r, fig.width = 9, fig.height = 9}
+item_cor <- hetcor(item_data)$correlations
+
+corrplot(item_cor, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45)
+```
+
+# Regularised partial correlation network (Figure S1)
+
+```{r, fig.width = 10, fig.height = 8}
+network <- EBICglasso(item_cor, n = nrow(item_data), gamma = 0.5, threshold = TRUE)
+
+# Node groups by questionnaire (indices, in the order of the network columns)
+node_groups <- lapply(item_groups, function(items) match(items, colnames(item_data)))
+
+qgraph(network,
+       layout = "spring",
+       labels = colnames(item_data),
+       label.cex = 4,
+       label.prop = 0.6,
+       edge.labels = FALSE,
+       minimum = 0.07,          # display only: hides very weak edges
+       groups = node_groups,
+       color = c("lightblue", "red", "orange"),
+       vsize = 7,
+       legend = TRUE)
+```
+
+# Louvain community detection
+
+Communities were identified on the absolute edge weights.
+
+```{r, fig.width = 10, fig.height = 8}
+graph_abs <- graph_from_adjacency_matrix(abs(network), mode = "undirected",
+                                         weighted = TRUE, diag = FALSE)
+
+set.seed(42)   # Louvain uses a random node order
+louvain <- cluster_louvain(graph_abs)
+
+cat("Louvain modularity Q =", round(modularity(louvain), 3), "\n")
+
+communities <- tibble(item = colnames(item_data),
+                      community = as.vector(membership(louvain))) %>%
+  arrange(community)
+communities
+
+plot(graph_abs,
+     vertex.color = rainbow(max(membership(louvain)))[membership(louvain)],
+     vertex.size = 8,
+     vertex.label.cex = 1.2,
+     edge.width = E(graph_abs)$weight * 5,
+     main = "Louvain communities")
+```
+
+# Robustness check: Walktrap
+
+```{r}
+walktrap <- cluster_walktrap(graph_abs)
+cat("Walktrap modularity Q =", round(modularity(walktrap), 3), "\n")
+
+communities %>%
+  mutate(walktrap = as.vector(membership(walktrap))[match(item, colnames(item_data))])
+```
+
+# References
+
+Holmes, J., Bryant, A., & Gathercole, S. E. (2019). Protocol for a transdiagnostic study of children with problems of attention, learning and memory (CALM). *BMC Pediatrics, 19*, 10. https://doi.org/10.1186/s12887-018-1385-3

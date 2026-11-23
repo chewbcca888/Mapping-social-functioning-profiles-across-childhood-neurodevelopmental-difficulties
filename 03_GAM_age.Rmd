@@ -1,0 +1,241 @@
+---
+title: "Age and social profile expression (GAMs)"
+author: "Estherina Trachtenberg"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+Code accompanying: Trachtenberg, E., Mousley, A., Jelen, M., & Astle, D. *Mapping social functioning profiles across childhood neurodevelopmental difficulties: links with diagnosis, cognition, and everyday executive function.*
+
+Categorical profile membership captures only children with a clear expression of one profile, so it may obscure graded differences with age. We therefore examined age as a continuous predictor of profile expression, using generalised additive models (GAMs; R package mgcv) of the centroid-distance scores, with a cubic regression spline for age (k = 10), adjusted for sex and referral status. P values were corrected across the four profiles using the Benjamini-Hochberg false discovery rate. The same models were fitted to the four social dimension scores (supplement).
+
+**Data availability.** No data are included in this repository; the code is shared to show the analysis. CALM data are available via the [CALM data portal](https://portal.camide.cam.ac.uk/overview/1158), subject to the cohort's data access procedures.
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(mgcv)
+```
+
+# Load data
+
+One row per child: age, sex, referral status, the four social dimension scores (SOM input, 0-1) and the four centroid-distance scores (output of `02_SOM_social_profiles.ipynb`).
+
+```{r}
+dat <- read_csv("merged_data.csv") %>%
+  rename(any_of(c(age_in_months       = "age_in_months_x",
+                  sex                 = "sex_x",
+                  referral            = "source",
+                  prosocial           = "prosocial_org",
+                  friendship          = "making_friends_org",
+                  withdrawal          = "social_difficulty_org",
+                  victimisation       = "rejection/bullying_org",
+                  dist_friendship     = "dist_making_friends",
+                  dist_withdrawal     = "dist_social_difficulty",
+                  dist_victimisation  = "dist_rejection_bullying"))) %>%
+  mutate(sex = factor(sex),
+         referral = factor(referral),
+         age_years = age_in_months / 12)
+
+# Checks: N should be 992
+nrow(dat)
+table(dat$sex, useNA = "always")
+table(dat$referral, useNA = "always")
+```
+
+# Names, order and colours
+
+```{r}
+profiles <- c(dist_friendship    = "Friendship difficulties",
+              dist_withdrawal    = "Social withdrawal",
+              dist_victimisation = "Peer victimisation",
+              dist_prosocial     = "Prosocial behaviour")
+
+dims <- c(friendship    = "Friendship difficulties",
+          withdrawal    = "Social withdrawal",
+          victimisation = "Peer victimisation",
+          prosocial     = "Prosocial behaviour")
+
+colours <- c("Friendship difficulties" = "#8C82C9",
+             "Social withdrawal"       = "#D79251",
+             "Peer victimisation"      = "#D97591",
+             "Prosocial behaviour"     = "#56A89C")
+
+# Dashed line = no significant age effect (friendship difficulties, q = .09)
+linetypes <- c("Friendship difficulties" = "dashed",
+               "Social withdrawal"       = "solid",
+               "Peer victimisation"      = "solid",
+               "Prosocial behaviour"     = "solid")
+```
+
+# Age distribution
+
+```{r}
+summary(dat$age_years)
+
+dat %>%
+  mutate(age_band = cut(age_years, breaks = c(5, 8, 11, 14, 19), right = FALSE)) %>%
+  count(age_band)
+```
+
+# Model functions
+
+```{r}
+fit_gam <- function(y) {
+  gam(as.formula(paste0(y, " ~ s(age_years, bs = 'cr', k = 10) + sex + referral")),
+      data = dat, method = "REML")
+}
+
+# Age effect, FDR-corrected p, and deviance explained by age
+# (full model minus the model without age)
+age_table <- function(models, labels) {
+  imap_dfr(models, function(m, y) {
+    m0 <- gam(as.formula(paste0(y, " ~ sex + referral")), data = dat, method = "REML")
+    st <- summary(m)$s.table
+    tibble(Outcome = labels[[y]],
+           N = nobs(m),
+           edf = st[1, "edf"],
+           F = st[1, "F"],
+           p = st[1, "p-value"],
+           `Deviance explained by age (%)` = (summary(m)$dev.expl - summary(m0)$dev.expl) * 100)
+  }) %>%
+    mutate(p_FDR = p.adjust(p, method = "BH"),
+           across(c(edf, F, `Deviance explained by age (%)`), ~ round(.x, 2)),
+           across(c(p, p_FDR), ~ signif(.x, 3)))
+}
+
+# Predicted values across age, for the most common sex and referral group
+mode_level <- function(x) names(which.max(table(x)))
+
+grid <- tibble(
+  age_years = seq(min(dat$age_years, na.rm = TRUE), max(dat$age_years, na.rm = TRUE),
+                  length.out = 200),
+  sex = factor(mode_level(dat$sex), levels = levels(dat$sex)),
+  referral = factor(mode_level(dat$referral), levels = levels(dat$referral))
+)
+
+predict_age <- function(models, labels) {
+  imap_dfr(models, function(m, y) {
+    p <- predict(m, newdata = grid, se.fit = TRUE)
+    grid %>% mutate(fit = p$fit,
+                    lower = p$fit - 1.96 * p$se.fit,
+                    upper = p$fit + 1.96 * p$se.fit,
+                    Outcome = labels[[y]])
+  }) %>%
+    mutate(Outcome = factor(Outcome, levels = labels))
+}
+
+raw_long <- function(labels) {
+  dat %>%
+    select(age_years, all_of(names(labels))) %>%
+    pivot_longer(-age_years, names_to = "var", values_to = "score") %>%
+    mutate(Outcome = factor(labels[var], levels = labels))
+}
+
+cat("Predictions shown for sex =", mode_level(dat$sex),
+    "and referral =", mode_level(dat$referral), "\n")
+```
+
+# Centroid-distance scores by age
+
+Lower distance indicates greater proximity to the profile centroid, and therefore stronger expression of that profile.
+
+```{r}
+models_dist <- map(names(profiles), fit_gam) %>% set_names(names(profiles))
+
+# Model checks: k-index close to 1 and residuals
+walk(models_dist, ~ { gam.check(.x); cat("\n") })
+
+age_stats_dist <- age_table(models_dist, profiles)
+age_stats_dist
+```
+
+## Figure: predicted centroid distance by age
+
+```{r, fig.width = 7, fig.height = 5}
+preds_dist <- predict_age(models_dist, profiles)
+
+fig_dist <- ggplot(preds_dist, aes(x = age_years, y = fit,
+                                   colour = Outcome, fill = Outcome, linetype = Outcome)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1.3) +
+  geom_rug(data = dat, aes(x = age_years), inherit.aes = FALSE, sides = "b", alpha = 0.2) +
+  scale_y_reverse() +
+  scale_x_continuous(breaks = c(5, 8, 11, 14, 18)) +
+  scale_colour_manual(values = colours) +
+  scale_fill_manual(values = colours) +
+  scale_linetype_manual(values = linetypes) +
+  labs(x = "Age (years)",
+       y = "Predicted distance to profile centroid\n(lower = stronger expression)",
+       colour = "Profile", fill = "Profile", linetype = "Profile") +
+  theme_classic() +
+  theme(text = element_text(size = 14))
+
+fig_dist
+```
+
+## Figure: one panel per profile, with raw data
+
+```{r, fig.width = 9, fig.height = 7}
+fig_dist_panels <- ggplot(preds_dist, aes(x = age_years, y = fit, colour = Outcome)) +
+  geom_point(data = raw_long(profiles), aes(y = score), alpha = 0.15, size = 0.8,
+             position = position_jitter(width = 0, height = 0.05, seed = 1)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = Outcome), alpha = 0.25, colour = NA) +
+  geom_line(aes(linetype = Outcome), linewidth = 1.3) +
+  facet_wrap(~ Outcome, nrow = 2) +
+  scale_colour_manual(values = colours, guide = "none") +
+  scale_fill_manual(values = colours, guide = "none") +
+  scale_linetype_manual(values = linetypes, guide = "none") +
+  scale_x_continuous(breaks = c(5, 8, 11, 14, 18)) +
+  labs(x = "Age (years)", y = "Distance to profile centroid\n(lower = closer)") +
+  theme_classic() +
+  theme(text = element_text(size = 14),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+fig_dist_panels
+```
+
+# Supplement: social dimension scores by age
+
+The same models fitted to the four social dimension scores (0-1; higher = more of that dimension).
+
+```{r}
+models_dim <- map(names(dims), fit_gam) %>% set_names(names(dims))
+
+walk(models_dim, ~ { gam.check(.x); cat("\n") })
+
+age_stats_dim <- age_table(models_dim, dims)
+age_stats_dim
+```
+
+```{r, fig.width = 9, fig.height = 7}
+preds_dim <- predict_age(models_dim, dims)
+
+fig_dim_panels <- ggplot(preds_dim, aes(x = age_years, y = fit, colour = Outcome)) +
+  geom_point(data = raw_long(dims), aes(y = score), alpha = 0.15, size = 0.8,
+             position = position_jitter(width = 0, height = 0.015, seed = 1)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = Outcome), alpha = 0.25, colour = NA) +
+  geom_line(linewidth = 1.3) +
+  facet_wrap(~ Outcome, nrow = 2) +
+  scale_colour_manual(values = colours, guide = "none") +
+  scale_fill_manual(values = colours, guide = "none") +
+  scale_x_continuous(breaks = c(5, 8, 11, 14, 18)) +
+  labs(x = "Age (years)", y = "Dimension score") +
+  theme_classic() +
+  theme(text = element_text(size = 14),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+fig_dim_panels
+```
+
+# Software versions
+
+```{r}
+sessionInfo()
+```
